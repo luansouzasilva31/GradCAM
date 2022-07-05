@@ -1,111 +1,119 @@
-import tensorflow as tf
+import io
+import cv2
 import numpy as np
-import matplotlib.cm as cm
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import Model
 
-class GradCAM:
-    def __init__(self, model, sample, save_path='./gradcam.png', alpha=0.5, pred_index=None, conv_layer_name=None):
-        # model: modelo a ser utilizado
-        # conv_layer_name: nome da camada convolucional a ser utilizada.
-        self.model = model
-        self.sample = sample
-        self.save_path = save_path
-        self.alpha = alpha
-        self.pred_index = pred_index
-        self.conv_layer_name = conv_layer_name
-        
-        # Se conv_layer_name=None, tenta achar automaticamente o ultimo
-        # conv layer do modelo.
-        if self.conv_layer_name is None:
-            self.conv_layer_name = self.find_last_convlayer()
-        
-        # extract gradcam
-        self.extract()
-        
-        # saving gradcam
-        self.save()
-        
+
+class GradCAM :
     
-    def find_last_convlayer(self):
-        ''' Função para encontrar a última camada convolucional do modelo.
-        Se não houver nenhuma, retorna um erro.'''
-        
-        # reversed: retorna um interator que acessa a sequência na ordem inversa.
-        # isso é feito pois se quer analisar da última p/ primeira camada.
-        for layer in reversed(self.model.layers):
-            if len(layer.output_shape) == 4: # se é um tensor 4D...
+    def __init__(self , model , layer_name=None) :
+        # store the model, the class index used to measure the class
+        # activation map, and the layer to be used when visualizing
+        # the class activation map
+        self.model = model
+        self.layer_name = layer_name
+        # if the layer name is None, attempt to automatically find
+        # the target output layer
+        if self.layer_name is None :
+            self.layer_name = self.find_target_layer()
+    
+    def find_target_layer(self) :
+        # attempt to find the final convolutional layer in the network
+        # by looping over the layers of the network in reverse order
+        for layer in reversed(self.model.layers) :
+            # check to see if the layer has a 4D output
+            if len(layer.output_shape) == 4 :
                 return layer.name
-        # Caso não, GradCAM não pode ser aplicado. Assim, um erro é retornado:
+        # otherwise, we could not find a 4D layer so the GradCAM
+        # algorithm cannot be applied
         raise ValueError("Could not find 4D layer. Cannot apply GradCAM.")
     
-    def extract(self):
-        ''' Extrai gradcam da amostra baseado no modelo. '''
-        # Definindo model para gradcam
-        # insere uma segunda saída: camada convolucional
-        grad_model = tf.keras.models.Model([self.model.inputs],
-                                           [self.model.get_layer(self.conv_layer_name).output,
-                                            self.model.output])
+    def compute_heatmap(self , image , class_idx , eps=1e-8) :
+        # construct our gradient model by supplying (1) the inputs
+        # to our pre-trained model, (2) the output of the (presumably)
+        # final 4D layer in the network, and (3) the output of the
+        # softmax activations from the model
+        grad_model = Model(
+            inputs=[self.model.inputs] ,
+            outputs=[self.model.get_layer(self.layer_name).output ,
+                     self.model.output])
         
-        # calculando gradiente para a amostra
-        with tf.GradientTape() as tape:
-            # retorna as predições para cada saída.
-            self.conv_output, preds = grad_model(self.sample) 
-            # se a predição não foi previamente informada...
-            if self.pred_index is None:
-                pred_index = tf.argmax(preds[0])
-            class_channel = preds[:, pred_index]
+        # record operations for automatic differentiation
+        with tf.GradientTape() as tape :
+            # cast the image tensor to a float-32 data type, pass the
+            # image through the gradient model, and grab the loss
+            # associated with the specific class index
+            inputs = tf.cast(image , tf.float32)
+            (conv_outputs , predictions) = grad_model(inputs)
+            loss = predictions[: , class_idx]
+        # use automatic differentiation to compute the gradients
+        grads = tape.gradient(loss , conv_outputs)
         
-        # gradiente do neurônio de saída
-        grads = tape.gradient(class_channel, self.conv_output)
+        # compute the guided gradients
+        cast_conv_outputs = tf.cast(conv_outputs > 0 , "float32")
+        cast_grads = tf.cast(grads > 0 , "float32")
+        guided_grads = cast_conv_outputs * cast_grads * grads
+        # the convolution and guided gradients have a batch dimension
+        # (which we don't need) so let's grab the volume itself and
+        # discard the batch
+        conv_outputs = conv_outputs[0]
+        guided_grads = guided_grads[0]
         
-        # este é um vetor onde cada entrada é a intensidade média do gradiente
-        # em um canal de mapa de recuros específico
-        pooled_grads = tf.reduce_mean(grads, axis=(0,1,2))
+        # compute the average of the gradient values, and using them
+        # as weights, compute the ponderation of the filters with
+        # respect to the weights
+        weights = tf.reduce_mean(guided_grads , axis=(0 , 1))
+        cam = tf.reduce_sum(tf.multiply(weights , conv_outputs) , axis=-1)
         
-        # multplicando cada canal na matriz do gradcam
-        # por "quão importante este canal é" em relação à melhor classe prevista
-        # em seguida, some todos os canais para obter a ativação da classe do gradcam
-        self.conv_output = self.conv_output[0]
-        self.heatmap = self.conv_output @ pooled_grads[..., tf.newaxis]
-        self.heatmap = tf.squeeze(self.heatmap)
+        # grab the spatial dimensions of the input image and resize
+        # the output class activation map to match the input image
+        # dimensions
+        (w , h) = (image.shape[2] , image.shape[1])
+        heatmap = cv2.resize(cam.numpy() , (w , h))
+        # normalize the heatmap such that all values lie in the range
+        # [0, 1], scale the resulting values to the range [0, 255],
+        # and then convert to an unsigned 8-bit integer
+        numer = heatmap - np.min(heatmap)
+        denom = (heatmap.max() - heatmap.min()) + eps
+        heatmap = numer / denom
+        heatmap = (heatmap * 255).astype("uint8")
+        # return the resulting heatmap to the calling function
         
-        # normalizando o gradcam para fins de visualização
-        self.heatmap = tf.maximum(self.heatmap, 0)/tf.math.reduce_max(self.heatmap)
-        
-        self.heatmap = self.heatmap.numpy()
+        return heatmap
     
-    def save(self):
-        ''' Salva e plota o gradcam sobreposto na imagem de base '''
-        img = self.sample
-        img = np.squeeze(img, axis=0)
+    @staticmethod
+    def plot(image , heatmap , show: bool = True , save: bool = False , savepath: str = './plot.png' , mode: int = 1 ,
+             title: str = '' , interpolant: float = 0.5 , colormap='magma' , figsize=(16 , 12)) :
         
-        self.heatmap = np.uint8(255*self.heatmap)
+        assert 0 < interpolant < 1 , 'Heatmap Interpolation must be between 0 and 1'
         
-        # colorindo mapa de calor
-        jet = cm.get_cmap("jet")
+        # heatmap = cv2.applyColorMap(heatmap , cv2.COLORMAP_VIRIDIS)
         
-        # usando o padrão RGB para as cores do gradcam
-        jet_colors = jet(np.arange(256))[:, :3]
-        self.jet_heatmap = jet_colors[self.heatmap]
+        if mode == 1 :
+            # img = cv2.addWeighted(image , interpolant , heatmap , 1 - interpolant , 0)
+            img = (image * interpolant + heatmap * (1 - interpolant)).astype(np.uint64)
         
-        # criando uma imagem com o gradcam reajustado
-        self.jet_heatmap = tf.keras.preprocessing.image.array_to_img(self.jet_heatmap)
-        self.jet_heatmap = self.jet_heatmap.resize((img.shape[1], img.shape[0]))
-        self.jet_heatmap = tf.keras.preprocessing.image.img_to_array(self.jet_heatmap)
+        elif mode == 2 :
+            img = np.concatenate((image , heatmap) , axis=1).astype(np.uint64)
         
-        # sobrepondo o gradcam e a imagem em um mesmo ambiente de plotagem
-        self.superimposed_img = self.jet_heatmap*self.alpha + img*(1-self.alpha)
-        self.superimposed_img = tf.keras.preprocessing.image.array_to_img(self.superimposed_img)
+        elif mode == 3 :
+            img = np.concatenate((image , heatmap) , axis=0).astype(np.uint64)
         
-        # salvando a imagem obtida
-        self.superimposed_img.save(self.save_path)
-        print('Saved at {}'.format(self.save_path))
+        else :
+            raise NotImplementedError(f'mode={mode} not implemented.')
         
-        #return jet_heatmap, superimposed_img # retorna o gradcam resultante, e a sobreposição.        
+        # Plotando
+        if show :
+            plt.rcParams['figure.dpi'] = 100
             
+            fig , axis = plt.subplots(1 , 1 , num=title , figsize=figsize, facecolor='w' , edgecolor='k')
+            axis.imshow(img , cmap='magma')
+            plt.tight_layout()
+            plt.show(block=True)
         
-        
-        
-        
-        
-        
-        
+        # Salvando amostra
+        if save :
+            plt.imsave(savepath , img , cmap=colormap)
+            
